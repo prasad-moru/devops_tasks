@@ -1,0 +1,6 @@
+[2023-05-12 08:14:23] [INFO] [auth-service] User john.doe@example.com logged in successfully from 192.168.1.45
+[2023-05-12 09:22:15] [ERROR] [api-gateway] Failed to process request: Invalid token for user alice@example.com from 192.168.1.102
+[2023-05-12 09:23:18] [WARN] [payment-service] Slow response time (2345ms) for transaction #TX78901 from user alice@example.com
+[2023-05-12 10:45:11] [ERROR] [database-service] Query timeout for user bob@example.com
+[2023-05-12 11:30:05] [INFO] [file-service] File uploaded by user carol@example.com from 192.168.1.75
+[2023-05-12 12:15:42] [WARN] [auth-service] Multiple failed login attempts for user dave@example.com from 192.168.1.201
