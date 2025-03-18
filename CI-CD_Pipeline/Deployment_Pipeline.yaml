@@ -1,0 +1,247 @@
+name: Nginx App Deployment Pipeline with ArgoCD
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        type: string
+      promote_automatically:
+        description: 'Automatically promote to next environment if tests pass'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: jfrog.your-company.com
+  REPOSITORY: docker-local
+  IMAGE_NAME: nginx-app
+  GIT_OPS_REPO: prasad-moru/Devops_tasks
+  VAULT_ADDR: https://vault.your-company.com
+
+jobs:
+  update-manifest:
+    name: Update GitOps Manifest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ env.GIT_OPS_REPO }}
+          token: ${{ secrets.GIT_OPS_PAT }}
+          ref: main
+      
+      - name: Get Vault Secrets
+        id: vault-secrets
+        uses: hashicorp/vault-action@v2
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            secret/data/nginx-app/deploy ENV_SPECIFIC_CONFIG ;
+      
+      - name: Update Kustomize manifest
+        run: |
+          cd environments/${{ github.event.inputs.environment }}/nginx-app
+          
+          # Update the image tag in kustomization.yaml
+          sed -i "s|newTag:.*|newTag: ${{ github.event.inputs.image_tag }}|" kustomization.yaml
+          
+          # Create a timestamp for the commit message
+          TIMESTAMP=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          
+          # Create environment-specific configurations if needed
+          cat > config.env << EOF
+          ENV=${{ github.event.inputs.environment }}
+          TIMESTAMP=$TIMESTAMP
+          EOF
+          
+          # Show changes for logging
+          git diff
+      
+      - name: Commit and push changes
+        run: |
+          git config user.name "ArgoCD Deployment Bot"
+          git config user.email "argocd-bot@your-company.com"
+          
+          git add environments/${{ github.event.inputs.environment }}/nginx-app/
+          git commit -m "Update nginx-app image to ${{ github.event.inputs.image_tag }} for ${{ github.event.inputs.environment }}"
+          git push
+  
+  sync-application:
+    name: Sync ArgoCD Application
+    needs: update-manifest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+          rm argocd-linux-amd64
+      
+      - name: Login to ArgoCD
+        run: |
+          argocd login ${{ secrets.ARGOCD_SERVER }} --username ${{ secrets.ARGOCD_USERNAME }} --password ${{ secrets.ARGOCD_PASSWORD }}
+      
+      - name: Sync ArgoCD application
+        run: |
+          # Trigger sync for the application
+          argocd app sync nginx-app-${{ github.event.inputs.environment }}
+          
+          # Wait for sync to complete
+          argocd app wait nginx-app-${{ github.event.inputs.environment }} --health
+  
+  deployment-verification:
+    name: Verify Deployment
+    needs: sync-application
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.25.0'
+      
+      - name: Configure Kubernetes credentials
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG_${{ github.event.inputs.environment }} }}
+      
+      - name: Verify pods are running
+        run: |
+          kubectl -n ${{ github.event.inputs.environment }} wait --for=condition=ready pod -l app=nginx-app --timeout=180s
+      
+      - name: Run smoke tests
+        run: |
+          # Get service URL based on environment
+          if [ "${{ github.event.inputs.environment }}" == "Stg" ]; then
+            TEST_URL="https://nginx.your-company.com/health"
+          else
+            TEST_URL="https://nginx.${{ github.event.inputs.environment }}.your-company.com/health"
+          fi
+          
+          # Simple curl test to check health endpoint
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" $TEST_URL)
+          
+          if [ $STATUS_CODE -eq 200 ]; then
+            echo "Health check passed: $STATUS_CODE"
+          else
+            echo "Health check failed: $STATUS_CODE"
+            exit 1
+          fi
+  
+  notify-slack:
+    name: Notify Deployment Status
+    needs: [sync-application, deployment-verification]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [ "${{ needs.deployment-verification.result }}" == "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=Deployment of nginx-app:${{ github.event.inputs.image_tag }} to ${{ github.event.inputs.environment }} was successful!" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message= Deployment of nginx-app:${{ github.event.inputs.image_tag }} to ${{ github.event.inputs.environment }} failed. Please check logs." >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.message }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Deployment Status: ${{ github.event.inputs.environment }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ steps.status.outputs.message }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Environment:*\n${{ github.event.inputs.environment }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Image:*\n${{ env.IMAGE_NAME }}:${{ github.event.inputs.image_tag }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View in ArgoCD"
+                      },
+                      "url": "${{ secrets.ARGOCD_URL }}/applications/nginx-app-${{ github.event.inputs.environment }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+  
+  promote-to-next:
+    name: Promote to Next Environment
+    needs: [deployment-verification]
+    if: github.event.inputs.promote_automatically == 'true' && needs.deployment-verification.result == 'success' && github.event.inputs.environment != 'production'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine next environment
+        id: next-env
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "dev" ]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.inputs.environment }}" == "staging" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "No further environment to promote to"
+            exit 0
+          fi
+      
+      - name: Trigger next deployment
+        if: steps.next-env.outputs.environment != ''
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GIT_OPS_PAT }}
+          script: |
+            github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'argocd-deployment.yml',
+              ref: 'main',
+              inputs: {
+                environment: '${{ steps.next-env.outputs.environment }}',
+                image_tag: '${{ github.event.inputs.image_tag }}',
+                promote_automatically: false
+              }
+            })

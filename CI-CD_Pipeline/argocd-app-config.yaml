@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nginx-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/prasad-moru/forntnd_canary.git
+    targetRevision: HEAD
+    path: environments/production/nginx-app
+    kustomize:
+      images:
+        - 123456789012.dkr.ecr.us-east-1.amazonaws.com/nginx-app:latest
+  destination:
+    server: https://kubernetes.frontend.svc
+    namespace: frontend
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

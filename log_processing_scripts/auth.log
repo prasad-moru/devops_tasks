@@ -1,0 +1,5 @@
+Mar 18 10:05:23 server sshd[12345]: Failed password for user alice from 192.168.1.10 port 22 ssh2
+Mar 18 10:06:45 server sshd[67890]: Accepted password for user bob from 192.168.1.20 port 22 ssh2
+Mar 18 10:07:30 server sshd[13579]: Failed password for user charlie from 192.168.1.30 port 22 ssh2
+Mar 18 10:08:15 server sshd[24680]: Accepted password for user dave from 192.168.1.40 port 22 ssh2
+Mar 18 10:09:05 server sshd[11223]: Failed password for user eve from 192.168.1.50 port 22 ssh2

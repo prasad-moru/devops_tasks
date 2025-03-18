@@ -1,0 +1,161 @@
+name: Nginx Application CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, 'release/**' ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: nginx-app
+  IMAGE_NAME: nginx-app
+  K8S_NAMESPACE: production
+  VAULT_ADDR: https://vault.your-company.com
+
+jobs:
+  code-quality:
+    name: Code Quality & Security Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=nginx-app
+            -Dsonar.projectName=nginx-app
+      
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'nginx-app'
+          path: '.'
+          format: 'HTML'
+          out: 'reports'
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+      
+      - name: Upload Dependency Check Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-check-report
+          path: reports/
+
+  build:
+    name: Build and Scan Docker Image
+    needs: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Get Vault Secrets
+        id: vault-secrets
+        uses: hashicorp/vault-action@v2
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            secret/data/nginx-app/config API_KEY ;
+            secret/data/nginx-app/config DB_PASSWORD ;
+            secret/data/nginx-app/cert TLS_CERT ;
+      
+      - name: Extract version from package.json
+        id: extract_version
+        run: |
+          if [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            # For release branches, extract version from branch name and package.json
+            BRANCH_VERSION=$(echo ${{ github.ref }} | sed 's/refs\/heads\/release\///')
+            APP_VERSION=$(grep -m1 '"version"' package.json | cut -d'"' -f4)
+            SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+            echo "IMAGE_TAG=${APP_VERSION}-${SHORT_SHA}" >> $GITHUB_ENV
+          else
+            # For other branches, just use the SHA
+            echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+          fi
+          
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ github.ref == 'refs/heads/main' && format('{0}/{1}:latest', steps.login-ecr.outputs.registry, env.ECR_REPOSITORY) || '' }}
+          build-args: |
+            API_KEY=${{ steps.vault-secrets.outputs.API_KEY }}
+      
+      - name: Scan Docker Image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+      
+      - name: Upload Trivy Scan Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  publish-image-info:
+    name: Publish Image Information
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        
+      - name: Create Image Info Artifact
+        run: |
+          mkdir -p ./image-info
+          echo "Image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" > ./image-info/image-details.txt
+          echo "Commit: ${{ github.sha }}" >> ./image-info/image-details.txt
+          echo "Branch: ${{ github.ref }}" >> ./image-info/image-details.txt
+          echo "Build Date: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> ./image-info/image-details.txt
+          
+          if [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            echo "Release: true" >> ./image-info/image-details.txt
+            echo "Version: ${{ env.IMAGE_TAG }}" >> ./image-info/image-details.txt
+          fi
+      
+      - name: Upload Image Info
+        uses: actions/upload-artifact@v3
+        with:
+          name: image-info
+          path: ./image-info/

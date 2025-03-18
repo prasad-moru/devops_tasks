@@ -1,0 +1,20 @@
+classDiagram
+    class LogEntry {
+        +str timestamp
+        +str level
+        +str service
+        +str email
+        +str ip
+        +to_csv_row() List[str]
+        +__lt__(other) bool
+    }
+    
+    class LogProcessor {
+        +str log_file_path
+        +List[LogEntry] entries
+        +process() None
+        -_process_line(line) None
+        +write_csv(output_file) None
+    }
+    
+    LogProcessor --> LogEntry : creates
